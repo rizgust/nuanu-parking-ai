@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-04-09
-last_updated: 2026-04-09
+last_updated: 2026-04-09T12:00:00Z
 project: nuanu-parking-ai
 project_key: NOKEY
 tracking_system: file-system
@@ -45,8 +45,8 @@ development_status:
   # ─────────────────────────────────────────────────────────
   # Epic 1: Parking Zones Are Monitored and Vehicle Counts Are Accurate
   # ─────────────────────────────────────────────────────────
-  epic-1: backlog
-  1-1-project-scaffold-and-docker-compose-foundation: backlog
+  epic-1: in-progress
+  1-1-project-scaffold-and-docker-compose-foundation: ready-for-dev
   1-2-zone-configuration-schema-and-loading: backlog
   1-3-frigate-nvr-setup-and-zone-masking: backlog
   1-4-counter-service-vehicle-detection-pipeline: backlog
