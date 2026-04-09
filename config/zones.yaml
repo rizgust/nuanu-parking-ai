@@ -1,0 +1,29 @@
+# Parking zone definitions for nuanu-parking-ai
+#
+# zone_id:          Lowercase-hyphenated identifier. Used in MQTT topics, HTML IDs, DB rows.
+#                   E.g. "lot-a" → topic "parking/lot-a/state" → HTML id="zone-lot-a"
+# name:             Human-readable display name shown on dashboard
+# camera_rtsp_sub:  Hikvision RTSP sub-stream URL (lower res, for inference)
+#                   Format: rtsp://user:pass@<ip>:554/Streaming/Channels/101
+# capacity:         Total vehicle capacity for this zone
+# threshold:        Occupancy ratio (0.0–1.0) to trigger Telegram alert (default: 0.80 = 80%)
+# rearm_threshold:  Occupancy ratio to re-arm alert after firing (default: 0.70 = 70%)
+# vehicle_classes:  Vehicle types to count. Options: car, truck, motorcycle, bus
+
+zones:
+  - zone_id: "lot-a"
+    name: "Lot A — Main Entrance"
+    camera_rtsp_sub: "rtsp://admin:password@192.168.1.10:554/Streaming/Channels/101"
+    capacity: 50
+    threshold: 0.80
+    rearm_threshold: 0.70
+    vehicle_classes: ["car", "truck", "motorcycle", "bus"]
+
+  # Example second zone — duplicate and edit for each additional zone
+  # - zone_id: "lot-b"
+  #   name: "Lot B — South Entrance"
+  #   camera_rtsp_sub: "rtsp://admin:password@192.168.1.11:554/Streaming/Channels/101"
+  #   capacity: 30
+  #   threshold: 0.80
+  #   rearm_threshold: 0.70
+  #   vehicle_classes: ["car", "truck", "motorcycle", "bus"]

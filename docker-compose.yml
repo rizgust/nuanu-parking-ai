@@ -1,0 +1,145 @@
+services:
+
+  # ─────────────────────────────────────────────────────────────
+  # MQTT Broker — internal message bus for all services
+  # ─────────────────────────────────────────────────────────────
+  mosquitto:
+    image: eclipse-mosquitto:2
+    restart: unless-stopped
+    networks:
+      - app-net
+    volumes:
+      - ./config/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto-data:/mosquitto/data
+    ports: []  # No external port exposure — app-net only
+
+  # ─────────────────────────────────────────────────────────────
+  # Frigate NVR — motion detection from RTSP camera streams
+  # Bridges camera-net (RTSP access) and app-net (MQTT publish)
+  # ─────────────────────────────────────────────────────────────
+  frigate:
+    image: ghcr.io/blakeblackshear/frigate:stable
+    restart: unless-stopped
+    privileged: true
+    shm_size: "64mb"
+    networks:
+      - camera-net
+      - app-net
+    volumes:
+      - ./config/frigate/config.yml:/config/config.yml:ro
+      - frigate-data:/media/frigate
+    environment:
+      FRIGATE_RTSP_PASSWORD: "${FRIGATE_RTSP_PASSWORD:-}"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:5000/api/version"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ─────────────────────────────────────────────────────────────
+  # Counter — YOLOv8 vehicle detection + zone state machine
+  # GPU-enabled (requires nvidia-container-toolkit on host)
+  # ─────────────────────────────────────────────────────────────
+  counter:
+    build:
+      context: .
+      dockerfile: services/counter/Dockerfile
+    restart: unless-stopped
+    networks:
+      - app-net
+    env_file:
+      - .env
+    volumes:
+      - ./config/zones.yaml:/config/zones.yaml:ro
+      - ./models:/app/models  # YOLOv8 weights cache
+    depends_on:
+      - mosquitto
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import counter; print('ok')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s  # Allow time for model weight download on first start
+
+  # ─────────────────────────────────────────────────────────────
+  # Watchdog — health monitoring + Telegram alerts
+  # ─────────────────────────────────────────────────────────────
+  watchdog:
+    build:
+      context: .
+      dockerfile: services/watchdog/Dockerfile
+    restart: unless-stopped
+    networks:
+      - app-net
+    env_file:
+      - .env
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro  # For container health monitoring
+    depends_on:
+      - mosquitto
+
+  # ─────────────────────────────────────────────────────────────
+  # Dashboard — FastAPI + HTMX + SSE web dashboard
+  # ─────────────────────────────────────────────────────────────
+  dashboard:
+    build:
+      context: .
+      dockerfile: services/dashboard/Dockerfile
+    restart: unless-stopped
+    networks:
+      - app-net
+    env_file:
+      - .env
+    volumes:
+      - ./config/zones.yaml:/config/zones.yaml:ro
+      - db-data:/data  # SQLite database persistence
+    depends_on:
+      - mosquitto
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # ─────────────────────────────────────────────────────────────
+  # Nginx — reverse proxy, exposes dashboard on host port 80
+  # ─────────────────────────────────────────────────────────────
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    networks:
+      - app-net
+    ports:
+      - "80:80"
+    volumes:
+      - ./config/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - dashboard
+
+# ─────────────────────────────────────────────────────────────
+# Networks
+# camera-net: Frigate ↔ Hikvision cameras (RTSP). Isolated from app services.
+# app-net:    All application services. Internal communication only.
+# ─────────────────────────────────────────────────────────────
+networks:
+  camera-net:
+    driver: bridge
+  app-net:
+    driver: bridge
+
+# ─────────────────────────────────────────────────────────────
+# Volumes
+# ─────────────────────────────────────────────────────────────
+volumes:
+  frigate-data:
+  mosquitto-data:
+  db-data:

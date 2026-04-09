@@ -1,7 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "WebSearch"
+      "WebSearch",
+      "Bash(where uv:*)",
+      "Read(//c/Users/rizgust/.local/bin/**)",
+      "Read(//c/Users/rizgust/.cargo/bin/**)",
+      "Bash(powershell.exe -Command \"where.exe uv\")",
+      "Bash(python3:*)"
     ]
   }
 }

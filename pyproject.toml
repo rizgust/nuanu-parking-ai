@@ -1,0 +1,19 @@
+[project]
+name = "nuanu-parking-ai"
+version = "0.1.0"
+description = "On-premises AI-powered parking occupancy monitoring system"
+requires-python = ">=3.12"
+
+[tool.uv.workspace]
+members = ["shared", "services/counter", "services/watchdog", "services/dashboard"]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.27",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["shared/tests", "services/counter/tests", "services/watchdog/tests", "services/dashboard/tests"]

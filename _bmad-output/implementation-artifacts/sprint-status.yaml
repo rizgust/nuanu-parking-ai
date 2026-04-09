@@ -46,7 +46,7 @@ development_status:
   # Epic 1: Parking Zones Are Monitored and Vehicle Counts Are Accurate
   # ─────────────────────────────────────────────────────────
   epic-1: in-progress
-  1-1-project-scaffold-and-docker-compose-foundation: ready-for-dev
+  1-1-project-scaffold-and-docker-compose-foundation: review
   1-2-zone-configuration-schema-and-loading: backlog
   1-3-frigate-nvr-setup-and-zone-masking: backlog
   1-4-counter-service-vehicle-detection-pipeline: backlog

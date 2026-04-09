@@ -1,0 +1,45 @@
+# Environment secrets — NEVER commit
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# UV lockfile generated files
+# (uv.lock is committed — do not gitignore it)
+
+# Database files
+*.db
+*.db-shm
+*.db-wal
+
+# ML model weights (large binary files, downloaded at build time)
+models/
+*.pt
+*.onnx
+*.engine
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Test / coverage
+.coverage
+.pytest_cache/
+htmlcov/
+.mypy_cache/
+
+# Docker
+# (docker-compose.override.yml is allowed for local dev overrides)

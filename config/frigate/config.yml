@@ -1,0 +1,36 @@
+# Frigate NVR configuration for nuanu-parking-ai
+# Full camera and motion zone setup is done in Story 1.3.
+# This is a minimal stub to allow Frigate to start.
+#
+# Documentation: https://docs.frigate.video/configuration/
+
+mqtt:
+  host: mosquitto
+  port: 1883
+  # topic_prefix: frigate  # default — events published to frigate/events
+
+# Detectors: use CPU for development; switch to coral/gpu for production
+detectors:
+  cpu1:
+    type: cpu
+    num_threads: 3
+
+# Cameras are configured in Story 1.3 when Hikvision RTSP URLs are available.
+# Example (uncomment and edit):
+#
+# cameras:
+#   lot-a-cam:
+#     ffmpeg:
+#       inputs:
+#         - path: rtsp://admin:password@192.168.1.10:554/Streaming/Channels/101
+#           roles:
+#             - detect
+#     detect:
+#       width: 1280
+#       height: 720
+#       fps: 5
+#     motion:
+#       mask:
+#         # Polygon points to exclude non-parking areas (road, footpath)
+#         # Format: x,y coordinates as fraction of frame (0.0–1.0)
+#         - 0,0,0.3,0,0.3,0.2,0,0.2
