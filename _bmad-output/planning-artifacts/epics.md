@@ -1,5 +1,7 @@
 ---
-stepsCompleted: [1, 2]
+stepsCompleted: [1, 2, 3, 4]
+status: 'complete'
+completedAt: '2026-04-09'
 inputDocuments:
   - "_bmad-output/planning-artifacts/prd.md"
   - "_bmad-output/planning-artifacts/architecture.md"
@@ -119,3 +121,455 @@ A password-protected web dashboard shows real-time vehicle counts, occupancy per
 ### Epic 4: Operations Leadership Can Access Historical Reports (Post-MVP Stub)
 Stub routes and storage infrastructure for post-MVP delivery. Operations leadership will eventually view peak-hour trends and export weekly reports. MVP delivers the data model and placeholder endpoints — no functional UI yet.
 **FRs covered:** FR-016 (stub), FR-017 (stub)
+
+---
+
+## Epic 1: Parking Zones Are Monitored and Vehicle Counts Are Accurate
+
+The system is deployed, zones are configured, and vehicle counts flow through the detection pipeline. The infra team can validate counting accuracy by inspecting MQTT output — before any UI or alerts are built. This foundational epic is the prerequisite for all other epics.
+
+### Story 1.1: Project Scaffold and Docker Compose Foundation
+
+As an infrastructure administrator,
+I want the nuanu-parking-ai project initialized as a Python UV monorepo with a complete Docker Compose stack,
+So that all services can be developed, tested, and deployed in a consistent environment from day one.
+
+**Acceptance Criteria:**
+
+**Given** the project root directory,
+**When** `uv sync` is run,
+**Then** the UV workspace resolves successfully with four workspace packages: shared, counter, watchdog, dashboard.
+
+**Given** a valid `.env` file (copied from `.env.example`),
+**When** `docker compose up -d` is run,
+**Then** all 6 containers start: frigate, mosquitto, counter, watchdog, dashboard, nginx — each with `restart: unless-stopped` policy.
+
+**Given** the Docker Compose configuration,
+**When** inspected,
+**Then** two Docker networks exist: `camera-net` (frigate only) and `app-net` (all application services), with no cross-contamination.
+
+**Given** `.env.example` in the project root,
+**When** read,
+**Then** it contains placeholder entries for all required environment variables: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DASHBOARD_USERNAME, DASHBOARD_PASSWORD, SECRET_KEY, MQTT_HOST, MQTT_PORT, YOLO_CONFIDENCE_THRESHOLD, HEARTBEAT_TIMEOUT_SECS — each with a comment describing its purpose.
+
+**Given** the project root,
+**When** `.gitignore` is inspected,
+**Then** the following are excluded from version control: `.env`, `*.db`, `*.pt`, `__pycache__/`, `models/`, `.venv/`.
+
+**Given** the monorepo structure,
+**When** inspected,
+**Then** it matches the canonical layout: `services/{counter,watchdog,dashboard}/`, `shared/`, `config/`, `nginx/`, `pyproject.toml` (UV workspace root), `docker-compose.yml`, `.env.example`.
+
+---
+
+### Story 1.2: Zone Configuration Schema and Loading (FR-008, FR-009)
+
+As an infrastructure administrator,
+I want to define parking zones in a YAML config file and have the system load them at startup,
+So that I can add, rename, or reconfigure zones by editing one file and restarting the service — no code changes required.
+
+**Acceptance Criteria:**
+
+**Given** `config/zones.yaml` contains one or more zone entries,
+**When** each entry is inspected,
+**Then** each entry includes all required fields: `zone_id` (lowercase-hyphenated string), `name` (display string), `camera_rtsp_sub` (RTSP URL string), `capacity` (int > 0), `threshold` (float 0.0–1.0), `rearm_threshold` (float 0.0–1.0, less than threshold), `vehicle_classes` (list, values from: car, truck, motorcycle, bus).
+
+**Given** the `shared` package,
+**When** `from shared.models import ZoneConfig` is executed,
+**Then** a Pydantic model exists that validates all zone fields and raises a descriptive `ValidationError` for any invalid entry.
+
+**Given** the counter service starts with a valid `zones.yaml`,
+**When** startup completes,
+**Then** the service logs the count and zone IDs of loaded zones at INFO level, e.g. `"Loaded 2 zones: ['lot-a', 'lot-b']"`.
+
+**Given** the counter service starts with an invalid `zones.yaml` (e.g. missing `capacity` field),
+**When** startup runs,
+**Then** the service exits with a non-zero code and logs a clear error message identifying the invalid field and zone_id — it does not silently start with partial config.
+
+**Given** `zones.yaml` is updated to add a new zone,
+**When** `docker compose restart counter` is run,
+**Then** the counter service reloads with the updated zone list within 60 seconds, without modifying any source code (FR-009).
+
+---
+
+### Story 1.3: Frigate NVR Setup and Zone Masking (FR-010)
+
+As an infrastructure administrator,
+I want Frigate NVR configured to monitor each parking zone's camera feed and detect motion only within the designated parking area,
+So that motion events are scoped to actual parking zones and irrelevant areas (roads, footpaths, trees) are masked out to reduce false triggers.
+
+**Acceptance Criteria:**
+
+**Given** `config/frigate/config.yml` with at least one RTSP camera source,
+**When** Frigate starts,
+**Then** it connects to the configured camera sub-stream without errors and the Frigate web UI (port 5000) shows the camera feed as active.
+
+**Given** a Frigate config with motion zones defined for a parking area,
+**When** a vehicle enters the defined zone boundary,
+**Then** Frigate publishes a motion event to the `frigate/events` MQTT topic on the Mosquitto broker.
+
+**Given** a Frigate config with a motion mask applied to non-parking areas (e.g. road in frame foreground),
+**When** movement occurs exclusively within the masked area,
+**Then** no MQTT event is published for that motion — only parking-zone motion triggers events.
+
+**Given** the Docker Compose network configuration,
+**When** Frigate is running,
+**Then** it is connected to both `camera-net` (for RTSP access) and `app-net` (for MQTT publishing), with no direct exposure to the host network beyond Frigate's own management port.
+
+**Given** a Docker restart of the Frigate container,
+**When** it comes back up,
+**Then** zone mask definitions are preserved via the `frigate-data` volume mount — no reconfiguration required.
+
+---
+
+### Story 1.4: Counter Service — Vehicle Detection Pipeline (FR-011, FR-012)
+
+As the system,
+I want to run YOLOv8 vehicle detection when Frigate reports motion in a parking zone,
+So that only confirmed vehicles (not shadows, animals, or pedestrians) increment the zone counter.
+
+**Acceptance Criteria:**
+
+**Given** a `frigate/events` MQTT message for a zone_id that exists in `zones.yaml`,
+**When** the counter service receives it,
+**Then** it captures the relevant camera frame for AI inference within 5 seconds of the event timestamp.
+
+**Given** a captured frame passed to the inference module,
+**When** YOLOv8 runs,
+**Then** only detections with confidence ≥ `YOLO_CONFIDENCE_THRESHOLD` (default 0.65) are returned — lower-confidence detections are discarded.
+
+**Given** YOLOv8 inference results for a zone whose `vehicle_classes` includes `"car"`,
+**When** a car is detected above threshold,
+**Then** it is counted; when a pedestrian or bicycle is detected — regardless of confidence — it is not counted.
+
+**Given** YOLOv8 inference is running (CPU/GPU-bound work),
+**When** called from the async service,
+**Then** it executes inside `asyncio.to_thread()` so the service's async event loop is not blocked.
+
+**Given** the counter Dockerfile,
+**When** built,
+**Then** YOLOv8n model weights (`yolov8n.pt`) are downloaded during the build step — the container does not require internet access at runtime to load the model.
+
+**Given** a `frigate/events` message for a `zone_id` not present in `zones.yaml`,
+**When** received by the counter,
+**Then** the event is silently ignored with a DEBUG-level log entry — no error is raised.
+
+---
+
+### Story 1.5: Zone State Machine with Debounce and MQTT Publishing (FR-013)
+
+As the system,
+I want a per-zone state machine that tracks vehicle counts with debounce logic and publishes stable zone state to MQTT,
+So that transient vehicle movements don't cause counter jitter and all consumers (dashboard, watchdog) always receive accurate, stable zone occupancy.
+
+**Acceptance Criteria:**
+
+**Given** a vehicle detection result for zone "lot-a",
+**When** `ZoneStateMachine.update()` is called,
+**Then** it recalculates `vehicle_count`, `occupancy_pct` (float 0.0–1.0), and `status` ("ok"/"warning"/"full") based on zone capacity and threshold.
+
+**Given** rapid consecutive detection frames that disagree (e.g. vehicle appears then disappears in alternating frames),
+**When** debounce logic is applied,
+**Then** the counter only updates if N consecutive frames agree on the vehicle count (N configurable, default 3) — a single divergent frame does not change the count.
+
+**Given** a zone state change after debounce,
+**When** published to MQTT topic `parking/{zone_id}/state`,
+**Then** the payload exactly matches the canonical schema: `{zone_id, vehicle_count, capacity, occupancy_pct, status, alert_armed, stream_healthy, timestamp}` — no extra or missing fields, no schema variants between services.
+
+**Given** a zone state MQTT publish,
+**When** sent to the broker,
+**Then** `retain=True` is set — a new subscriber receives the current state immediately on connection without waiting for the next event.
+
+**Given** the counter service starts fresh,
+**When** it initializes `ZoneStateMachine` for zone "lot-a",
+**Then** the initial state is: `vehicle_count=0`, `occupancy_pct=0.0`, `status="ok"`, `alert_armed=True`, `stream_healthy=True`.
+
+**Given** zone occupancy crosses the threshold (e.g. occupancy_pct=0.82 with threshold=0.80),
+**When** state is published,
+**Then** `status="warning"` and `alert_armed=True` appear in the MQTT payload.
+
+**And** all `timestamp` values in the payload use `datetime.now(timezone.utc)` — never `datetime.now()` (naive datetime is forbidden).
+
+---
+
+### Story 1.6: RTSP Stream Resilience and Graceful Degradation (FR-014, FR-015)
+
+As an infrastructure administrator,
+I want the system to automatically recover from dropped camera streams and flag degraded zones without affecting others,
+So that transient network issues never require manual restarts and operators always know which zones they can trust.
+
+**Acceptance Criteria:**
+
+**Given** an RTSP stream drop (camera unreachable or network interruption),
+**When** the counter detects the connection failure,
+**Then** it automatically attempts reconnection using exponential backoff: 1s → 2s → 4s → 8s → … → max 60s between retries.
+
+**Given** a stream has been lost for zone "lot-a",
+**When** the counter publishes the next zone state to MQTT,
+**Then** `stream_healthy=False` appears in the payload for "lot-a".
+
+**Given** `stream_healthy=False` for zone "lot-a" and zone "lot-b" is operating normally,
+**When** the system is running,
+**Then** "lot-b" continues publishing accurate zone state to MQTT without interruption or error.
+
+**Given** a previously dropped stream that successfully reconnects,
+**When** the RTSP connection re-establishes,
+**Then** `stream_healthy=True` is restored in subsequent MQTT publishes — no service restart required.
+
+**Given** a stream reconnect is in progress (backoff timer active),
+**When** Docker checks the counter container health,
+**Then** the health check returns healthy — the container is NOT restarted during the reconnect backoff period.
+
+---
+
+## Epic 2: Security Team Receives Proactive Capacity Alerts
+
+Security operators receive a Telegram alert when any zone hits its occupancy threshold, and another alert if the system fails. Re-arm logic prevents alert spam. The security team can act on parking issues without checking anything — the system tells them.
+
+### Story 2.1: Telegram Threshold Alerts and Re-Arm Logic (FR-001, FR-002)
+
+As a security operator,
+I want to receive a Telegram alert when a parking zone reaches its capacity threshold — and stop receiving repeated alerts until the zone clears,
+So that I can act proactively before a zone fills, without being spammed while it stays above threshold.
+
+**Acceptance Criteria:**
+
+**Given** zone "lot-a" with `threshold=0.80` and `alert_armed=True`,
+**When** `occupancy_pct` first crosses 0.80,
+**Then** a Telegram message is delivered to the configured chat ID within 60 seconds (NFR-001).
+
+**Given** the Telegram threshold alert is sent,
+**When** the message is received,
+**Then** it includes: zone name, current occupancy percentage (e.g. "82%"), absolute count and capacity (e.g. "41/50"), and a UTC timestamp.
+
+**Given** the threshold alert has fired (`alert_armed` set to False),
+**When** occupancy remains above threshold in subsequent state updates,
+**Then** no additional Telegram alerts are sent for that zone — duplicate suppression is active.
+
+**Given** `alert_armed=False` for a zone,
+**When** occupancy drops below `rearm_threshold` (default 0.70),
+**Then** `alert_armed` is set back to True — the alert re-arms for the next threshold crossing.
+
+**Given** the Telegram Bot API is temporarily unreachable,
+**When** a send attempt fails,
+**Then** the system retries once after 5 seconds; if the retry also fails, it logs an ERROR and continues — the alert pipeline is never blocked by a Telegram failure.
+
+**Given** multiple zones cross their thresholds within seconds of each other,
+**When** alerts are sent,
+**Then** each zone sends its own distinct Telegram message — alerts are not silently merged or dropped.
+
+---
+
+### Story 2.2: Watchdog Service — System Failure Detection and Telegram Alerts (FR-003)
+
+As a security operator,
+I want to receive a Telegram alert within 2 minutes when a camera stream is lost, an inference process crashes, or a service container fails,
+So that I know not to trust the data for affected zones and can contact the infra team without delay.
+
+**Acceptance Criteria:**
+
+**Given** the watchdog service is running and monitoring heartbeats,
+**When** no heartbeat is received from the counter service for more than `HEARTBEAT_TIMEOUT_SECS` (default 90s),
+**Then** a Telegram alert is sent within 2 minutes of the last valid heartbeat (NFR-002).
+
+**Given** a watchdog Telegram alert for service failure,
+**When** the message is received,
+**Then** it includes: a `[SYSTEM]` prefix, failure type (e.g. "Heartbeat timeout", "Container unhealthy"), affected service name, and last-seen timestamp.
+
+**Given** the watchdog monitors Docker container health via the Docker socket,
+**When** any monitored container (counter, dashboard, frigate) enters an "unhealthy" state,
+**Then** a Telegram alert is sent within 2 minutes identifying the container and failure state.
+
+**Given** `stream_healthy=False` appears in a zone's MQTT state,
+**When** the watchdog receives this event,
+**Then** a Telegram alert is sent identifying the affected zone and that its camera stream has been lost.
+
+**Given** a system failure alert has been sent for a specific condition (e.g. counter heartbeat timeout),
+**When** that same condition persists across multiple watchdog poll cycles,
+**Then** the alert does not re-fire on every cycle — it fires once per failure onset and re-arms when the condition clears.
+
+**Given** the watchdog service itself is running,
+**When** operating normally,
+**Then** it publishes its own heartbeat to `parking/system/health` every 60 seconds — so the absence of watchdog heartbeats would itself indicate a failure.
+
+---
+
+## Epic 3: Operators Can Monitor All Zones on the Live Dashboard
+
+A password-protected web dashboard shows real-time vehicle counts, occupancy percentages, zone status badges (OK / WARNING / FULL / DEGRADED), and a system health indicator. Zone tiles update in-place via SSE — no page reload. Operators have full situational awareness from any device on the network.
+
+### Story 3.1: Dashboard Authentication (FR-007, UX-DR3)
+
+As a security operator,
+I want to log in to the parking dashboard with a username and password,
+So that occupancy data is not accessible to anyone on the local network who opens a browser.
+
+**Acceptance Criteria:**
+
+**Given** an unauthenticated request to any dashboard route (e.g. `GET /`),
+**When** received by the server,
+**Then** the response is a 302 redirect to `/login` — no dashboard content is served to unauthenticated users.
+
+**Given** the `/login` page loads,
+**When** rendered,
+**Then** a form with username and password fields is shown — no other fields, no "remember me" checkbox in MVP.
+
+**Given** valid credentials matching `DASHBOARD_USERNAME` and `DASHBOARD_PASSWORD` env vars,
+**When** the login form is submitted,
+**Then** the user is redirected to `/` and a signed session cookie is set with an 8-hour expiry.
+
+**Given** invalid credentials (wrong username or wrong password),
+**When** the login form is submitted,
+**Then** the user remains on `/login` and an error message is displayed — the message must not reveal which credential was wrong (e.g. "Invalid username or password").
+
+**Given** a valid session cookie that has expired (> 8 hours old),
+**When** the next request is made,
+**Then** the user is redirected to `/login`.
+
+**Given** an authenticated user,
+**When** `GET /logout` is requested,
+**Then** the session cookie is cleared and the user is redirected to `/login`.
+
+**Given** the session cookie,
+**When** inspected,
+**Then** it is signed using `itsdangerous` `URLSafeTimedSerializer` with `SECRET_KEY` — the password is never stored in the cookie payload.
+
+---
+
+### Story 3.2: Live Zone Occupancy Dashboard with SSE (FR-004, FR-005, UX-DR1, UX-DR4, UX-DR5)
+
+As a security operator,
+I want to see all parking zones on a single page with live vehicle counts, occupancy percentages, and color-coded status badges that update automatically,
+So that I always have an up-to-date picture of parking occupancy across all zones without refreshing the page.
+
+**Acceptance Criteria:**
+
+**Given** the dashboard loads (authenticated user),
+**When** rendered,
+**Then** each configured zone appears as a tile displaying: zone name, vehicle count (e.g. "23"), total capacity (e.g. "/50"), occupancy percentage (e.g. "46%"), and a status badge.
+
+**Given** a zone with `status="ok"` (occupancy below threshold),
+**When** its tile is displayed,
+**Then** the status badge is styled green and shows "OK".
+
+**Given** a zone with `status="warning"` (occupancy ≥ threshold, < 100%),
+**When** its tile is displayed,
+**Then** the status badge is styled amber/yellow and shows "WARNING".
+
+**Given** a zone with `status="full"` (occupancy at 100%),
+**When** its tile is displayed,
+**Then** the status badge is styled red and shows "FULL".
+
+**Given** the SSE endpoint `GET /stream` is connected,
+**When** a zone state changes (new MQTT message received by the dashboard backend),
+**Then** the corresponding zone tile updates in-place via HTMX OOB swap — no full page reload occurs.
+
+**Given** the SSE connection drops (network interruption),
+**When** HTMX SSE reconnects to `/stream`,
+**Then** zone tiles are refreshed to current state (MQTT retained messages serve current state to new subscribers immediately).
+
+**Given** the dashboard is viewed on a mobile phone screen (min 375px wide),
+**When** rendered,
+**Then** zone tiles are readable without horizontal scrolling — layout adapts to a single-column or 2-column grid at narrow widths (UX-DR5).
+
+**Given** no zones are configured in `zones.yaml`,
+**When** the dashboard loads,
+**Then** an empty state message is shown (e.g. "No zones configured. Add zones to config/zones.yaml and restart.").
+
+---
+
+### Story 3.3: System Health Indicator and DEGRADED Zone Display (FR-006, FR-015 display, UX-DR2)
+
+As a security operator,
+I want to see a system health indicator on the dashboard and a DEGRADED badge on any zone with a lost camera stream,
+So that I immediately know when I cannot trust a zone's data and can distinguish live data from stale data.
+
+**Acceptance Criteria:**
+
+**Given** all zones have `stream_healthy=True`,
+**When** the dashboard is viewed,
+**Then** a system health banner or indicator shows a healthy status (e.g. green "All Systems Operational").
+
+**Given** zone "lot-a" has `stream_healthy=False` and the SSE update is received by the dashboard,
+**When** the zone tile is rendered,
+**Then** the status badge changes to "DEGRADED" styled in grey — overriding the occupancy-based status color.
+
+**Given** a zone tile showing "DEGRADED",
+**When** displayed,
+**Then** the vehicle count and occupancy % values are visually indicated as potentially stale (e.g. greyed out text or a stale indicator icon).
+
+**Given** zone "lot-a" is DEGRADED,
+**When** the dashboard is viewed,
+**Then** all other zones (e.g. "lot-b") continue to show their live occupancy data with normal status colors — DEGRADED state does not propagate.
+
+**Given** zone "lot-a" recovers (stream_healthy returns to True) and the SSE update is received,
+**When** the zone tile updates,
+**Then** it reverts to its current occupancy-based status (OK/WARNING/FULL) without a page reload.
+
+**Given** one or more zones are in DEGRADED state,
+**When** the system health indicator is displayed,
+**Then** it reflects the degraded state (e.g. amber "1 zone degraded") — operators can see at a glance that the system is not fully healthy.
+
+---
+
+### Story 3.4: Nginx Reverse Proxy and End-to-End Integration (FR-009, NFRs)
+
+As an infrastructure administrator,
+I want the dashboard accessible on the local network via standard HTTP through nginx, and all services to compose and restart cleanly after zone config changes,
+So that operators can access the dashboard from any device on the network and configuration updates take effect without downtime.
+
+**Acceptance Criteria:**
+
+**Given** nginx is running and the full Docker Compose stack is up,
+**When** a browser on the local network navigates to `http://<server-ip>/`,
+**Then** the request is proxied to the dashboard service and the login page renders correctly — no nginx errors in logs.
+
+**Given** all 6 Docker Compose services have started,
+**When** `docker compose ps` is run,
+**Then** all containers show status "Up" or "Up (healthy)" — no containers in "Exit" or "Restarting" state.
+
+**Given** `zones.yaml` is modified to add a new zone,
+**When** `docker compose restart counter dashboard` is run,
+**Then** the new zone appears as a tile on the dashboard within 60 seconds — no source code modification required (FR-009).
+
+**Given** nginx proxies the dashboard,
+**When** an unauthenticated request is made via nginx,
+**Then** the 302 redirect to `/login` is correctly forwarded to the client — nginx does not strip redirect headers or swallow Set-Cookie headers.
+
+**Given** the complete stack is torn down and restarted (`docker compose down && docker compose up -d`),
+**When** all containers are healthy,
+**Then** the dashboard is accessible, zone tiles load with retained MQTT state, and no manual re-initialization is required — all within 60 seconds of the last container reaching healthy state.
+
+---
+
+## Epic 4: Operations Leadership Can Access Historical Reports (Post-MVP Stub)
+
+Stub routes and storage infrastructure for post-MVP analytics delivery. Operations leadership will eventually view peak-hour trends and export weekly reports. This epic creates the data model and placeholder endpoints so no migration is needed when analytics are built.
+
+### Story 4.1: Historical Data Schema and Stub Routes (FR-016, FR-017)
+
+As an infrastructure administrator,
+I want the SQLite schema and stub API routes for historical occupancy data to be in place from day one,
+So that alert events are being recorded now and the reporting feature can be activated post-MVP without a database migration.
+
+**Acceptance Criteria:**
+
+**Given** `shared/db/schema.sql` is applied,
+**When** the SQLite database initializes,
+**Then** the following tables exist: `alert_events` (columns: id INTEGER PRIMARY KEY, zone_id TEXT, alert_type TEXT, occupancy_pct REAL, vehicle_count INTEGER, created_at TEXT) and `system_events` (columns: id INTEGER PRIMARY KEY, service TEXT, event_type TEXT, message TEXT, created_at TEXT).
+
+**Given** a threshold alert fires (from Epic 2),
+**When** the event is processed,
+**Then** a row is written to `alert_events` with the correct `zone_id`, `alert_type`, `occupancy_pct`, `vehicle_count`, and `created_at` in ISO 8601 UTC format.
+
+**Given** an authenticated user requests `GET /history`,
+**When** the route is called,
+**Then** a 200 response returns a page that displays "Historical reporting coming soon" — the route exists, is auth-protected, and returns a valid HTML response.
+
+**Given** an authenticated user requests `GET /history/export`,
+**When** the route is called,
+**Then** a 501 Not Implemented response is returned with JSON body: `{"detail": "Report export not yet implemented"}`.
+
+**Given** the SQLite database file at `/data/parking.db` on the `db-data` volume,
+**When** the dashboard container is restarted,
+**Then** existing `alert_events` rows are preserved — data persists across container restarts.
